@@ -1,13 +1,53 @@
-import React, { useState, useRef } from 'react';
+import React, { useState, useRef, useEffect } from 'react';
 import { useLiveQuery } from 'dexie-react-hooks';
 import { db, Product } from '../lib/db';
 import { Button } from '../components/ui/Button';
 import { Card, CardContent, CardHeader, CardTitle } from '../components/ui/Card';
 import ProductForm from '../components/forms/ProductForm';
-import { Plus, Edit2, Trash2, Search, Package, Upload } from 'lucide-react';
+import { Plus, Edit2, Trash2, Search, Package, Upload, Loader2, X } from 'lucide-react';
 import { Input } from '../components/ui/Input';
 import { formatCurrency } from '../lib/utils';
-import * as XLSX from 'xlsx';
+
+// Worker code as a string to avoid build configuration issues with imports
+const WORKER_CODE = `
+import * as XLSX from "https://esm.sh/xlsx@0.18.5";
+
+self.onmessage = async (e) => {
+  try {
+    const data = new Uint8Array(e.data);
+    const workbook = XLSX.read(data, { type: 'array' });
+    const sheetName = workbook.SheetNames[0];
+    const sheet = workbook.Sheets[sheetName];
+    const jsonData = XLSX.utils.sheet_to_json(sheet);
+
+    const mappedData = jsonData.map((row) => {
+      // Flexible field matching helper
+      const getVal = (keys) => {
+        for (const k of keys) {
+            // Exact match
+            if (row[k] !== undefined) return row[k];
+            // Case insensitive match
+            const found = Object.keys(row).find(rKey => rKey.toLowerCase() === k.toLowerCase());
+            if (found) return row[found];
+        }
+        return undefined;
+      };
+
+      return {
+        name: getVal(['Item Name', 'Product', 'Name', 'Product Name']) || 'Unknown',
+        hsn: String(getVal(['HSN', 'HSN Code']) || ''),
+        price: Number(getVal(['Rate', 'Price', 'Base Price', 'Ptr', 'MRP']) || 0),
+        taxRate: Number(getVal(['GST', 'Tax', 'Tax Rate']) || 0),
+        stock: Number(getVal(['Stock', 'Qty', 'Quantity']) || 0)
+      };
+    }).filter(p => p.name !== 'Unknown');
+
+    self.postMessage({ type: 'DONE', data: mappedData });
+  } catch (err) {
+    self.postMessage({ type: 'ERROR', error: err.message });
+  }
+};
+`;
 
 export default function ProductsPage() {
   const [isFormOpen, setIsFormOpen] = useState(false);
@@ -15,12 +55,30 @@ export default function ProductsPage() {
   const [search, setSearch] = useState("");
   const fileInputRef = useRef<HTMLInputElement>(null);
 
+  // Import State
+  const [isImporting, setIsImporting] = useState(false);
+  const [importProgress, setImportProgress] = useState(0);
+  const [importStatus, setImportStatus] = useState("");
+  const workerRef = useRef<Worker | null>(null);
+
   const products = useLiveQuery(async () => {
-    if (!search) return await db.products.toArray();
+    // Optimization: limit results if no search to prevent rendering 50k rows at once
+    if (!search) return await db.products.limit(100).toArray();
     return await db.products
       .filter(p => p.name.toLowerCase().includes(search.toLowerCase()) || p.hsn.includes(search))
+      .limit(100) // Always limit for performance
       .toArray();
   }, [search]);
+
+  // Setup Worker
+  useEffect(() => {
+    const blob = new Blob([WORKER_CODE], { type: "application/javascript" });
+    workerRef.current = new Worker(URL.createObjectURL(blob), { type: "module" });
+
+    return () => {
+      workerRef.current?.terminate();
+    };
+  }, []);
 
   const handleDelete = async (id: number) => {
     if (confirm('Are you sure you want to delete this product?')) {
@@ -44,39 +102,109 @@ export default function ProductsPage() {
 
   const handleFileUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
-    if (!file) return;
+    if (!file || !workerRef.current) return;
+
+    setIsImporting(true);
+    setImportProgress(0);
+    setImportStatus("Reading file...");
 
     try {
-      const data = await file.arrayBuffer();
-      const workbook = XLSX.read(data);
-      const sheet = workbook.Sheets[workbook.SheetNames[0]];
-      const jsonData = XLSX.utils.sheet_to_json(sheet);
+      const arrayBuffer = await file.arrayBuffer();
+      
+      // Send to worker
+      workerRef.current.postMessage(arrayBuffer);
 
-      // Map Excel columns to Product interface
-      const mappedProducts: Product[] = jsonData.map((row: any) => ({
-        name: row['Item Name'] || row['Product'] || row['Name'] || row['Product Name'] || 'Unknown',
-        hsn: String(row['HSN'] || row['HSN Code'] || ''),
-        price: Number(row['Rate'] || row['Price'] || row['Base Price'] || row['Ptr'] || 0),
-        taxRate: Number(row['GST'] || row['Tax'] || row['Tax Rate'] || 0),
-        stock: Number(row['Stock'] || row['Qty'] || row['Quantity'] || 0)
-      })).filter(p => p.name !== 'Unknown'); // Simple validation
+      workerRef.current.onmessage = async (event) => {
+        const { type, data, error } = event.data;
 
-      if (mappedProducts.length > 0) {
-        await db.products.bulkAdd(mappedProducts);
-        alert(`Successfully imported ${mappedProducts.length} products!`);
-      } else {
-        alert('No valid products found in the file. Please check column names.');
-      }
+        if (type === 'ERROR') {
+          alert(`Import failed: ${error}`);
+          setIsImporting(false);
+          return;
+        }
+
+        if (type === 'DONE') {
+          const productsToImport = data as Product[];
+          
+          if (productsToImport.length === 0) {
+            alert('No valid products found.');
+            setIsImporting(false);
+            return;
+          }
+
+          setImportStatus(`Found ${productsToImport.length} products. Saving to database...`);
+
+          // Chunked Insert to prevent UI freezing
+          const CHUNK_SIZE = 2000;
+          const total = productsToImport.length;
+          
+          try {
+            // Process in chunks to allow UI updates
+            for (let i = 0; i < total; i += CHUNK_SIZE) {
+              const chunk = productsToImport.slice(i, i + CHUNK_SIZE);
+              await db.products.bulkAdd(chunk);
+              
+              const progress = Math.round(((i + chunk.length) / total) * 100);
+              setImportProgress(progress);
+              setImportStatus(`Imported ${i + chunk.length} of ${total} products...`);
+              
+              // Yield to main thread to let React render the progress bar
+              await new Promise(resolve => setTimeout(resolve, 10));
+            }
+
+            setImportStatus("Complete!");
+            setTimeout(() => setIsImporting(false), 1000);
+            
+          } catch (dbError) {
+             console.error(dbError);
+             alert("Database error during import. Some products might be duplicates.");
+             setIsImporting(false);
+          }
+        }
+      };
+
     } catch (error) {
       console.error('Error importing file:', error);
       alert('Failed to process the file.');
+      setIsImporting(false);
     } finally {
       if (fileInputRef.current) fileInputRef.current.value = '';
     }
   };
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 relative">
+      {/* Import Modal Overlay */}
+      {isImporting && (
+        <div className="fixed inset-0 bg-black/50 z-50 flex items-center justify-center p-4">
+          <Card className="w-full max-w-md bg-white shadow-xl">
+            <CardHeader>
+              <CardTitle className="flex items-center gap-2">
+                <Loader2 className="w-5 h-5 animate-spin text-blue-600" />
+                Importing Products
+              </CardTitle>
+            </CardHeader>
+            <CardContent className="space-y-4">
+              <div className="space-y-2">
+                <div className="flex justify-between text-sm text-gray-600">
+                  <span>{importStatus}</span>
+                  <span className="font-medium">{importProgress}%</span>
+                </div>
+                <div className="h-2 w-full bg-gray-100 rounded-full overflow-hidden">
+                  <div 
+                    className="h-full bg-blue-600 transition-all duration-300 ease-out"
+                    style={{ width: `${importProgress}%` }}
+                  />
+                </div>
+              </div>
+              <p className="text-xs text-gray-500 text-center">
+                Please wait while we process your data. This may take a moment for large files.
+              </p>
+            </CardContent>
+          </Card>
+        </div>
+      )}
+
       <div className="flex flex-col sm:flex-row justify-between items-start sm:items-center gap-4">
         <div>
           <h1 className="text-2xl font-bold text-gray-900">Products</h1>
@@ -90,10 +218,10 @@ export default function ProductsPage() {
             accept=".xlsx, .xls" 
             onChange={handleFileUpload} 
           />
-          <Button variant="outline" onClick={handleImportClick}>
+          <Button variant="outline" onClick={handleImportClick} disabled={isImporting}>
             <Upload className="w-4 h-4 mr-2" /> Import Excel
           </Button>
-          <Button onClick={() => setIsFormOpen(true)}>
+          <Button onClick={() => setIsFormOpen(true)} disabled={isImporting}>
             <Plus className="w-4 h-4 mr-2" /> Add Product
           </Button>
         </div>
@@ -124,6 +252,9 @@ export default function ProductsPage() {
             onChange={(e) => setSearch(e.target.value)}
           />
         </div>
+        {search && (
+            <span className="text-sm text-gray-500">Showing matches for "{search}"</span>
+        )}
       </div>
 
       <div className="bg-white rounded-md border shadow-sm overflow-hidden">
@@ -144,7 +275,7 @@ export default function ProductsPage() {
                 <tr>
                   <td colSpan={6} className="px-6 py-12 text-center text-gray-500">
                     <Package className="w-12 h-12 mx-auto text-gray-300 mb-2" />
-                    No products found. Add one or import via Excel.
+                    {search ? 'No matches found.' : 'No products found. Add one or import via Excel.'}
                   </td>
                 </tr>
               )}
@@ -178,6 +309,11 @@ export default function ProductsPage() {
             </tbody>
           </table>
         </div>
+        {!search && (
+            <div className="px-6 py-3 border-t bg-gray-50 text-xs text-gray-500 text-center">
+                Showing first 100 items. Use search to find specific products.
+            </div>
+        )}
       </div>
     </div>
   );
